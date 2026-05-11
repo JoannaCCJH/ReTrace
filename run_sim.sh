@@ -46,3 +46,19 @@ xvfb-run -a python -m sim.visualize_pred \
     --config /n/home06/jcheng65/workspace/TraceGen/checkpoints/train.yaml \
     --resume /n/home06/jcheng65/workspace/TraceGen/checkpoints/tracegen_model.pth \
     --benchmark libero_90
+
+# Eval with the learned replan trigger (queried every 20 steps).
+xvfb-run -a python -m sim.run_libero_eval \
+      --config cfg/train.yaml \
+      --resume checkpoints/tracegen_model.pth \
+      --num_trials 5 \
+      --output ./libero_results/libero_90/trigger \
+      --override model.decoder.num_attention_heads=12 model.decoder.num_layers=6 \
+      --benchmark libero_90 \
+      --task STUDY_SCENE3_pick_up_the_white_mug_and_place_it_to_the_right_of_the_caddy \
+      --object_obs_key porcelain_mug_1_pos \
+      --goal_site_name study_table_desk_caddy_right_region \
+      --dz_scale 5.5 --placement_mode descend \
+      --trigger_ckpt trigger/checkpoints/trigger.pt \
+      --trigger_threshold 0.5 --trigger_freq 20 \
+      --viz_replans all
