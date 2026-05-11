@@ -44,6 +44,7 @@ class LiberoEnv:
                  object_obs_key: str = OBJECT_OBS_KEY,
                  goal_body_name: str | None = GOAL_BODY_NAME,
                  goal_site_name: str | None = None,
+                 perturb_body_name: str | None = None,
                  img_hw: tuple[int, int] = (128, 128)):
         if (goal_body_name is None) == (goal_site_name is None):
             raise ValueError(
@@ -72,6 +73,7 @@ class LiberoEnv:
         self._object_obs_key = object_obs_key
         self._goal_body_name = goal_body_name
         self._goal_site_name = goal_site_name
+        self._perturb_body_name = perturb_body_name
         self._last_obs: dict | None = None
 
     def reset(self, seed: int = 0) -> LiberoObs:
@@ -89,6 +91,52 @@ class LiberoEnv:
 
     def close(self) -> None:
         self._env.close()
+
+    def save_sim_state(self):
+        """Snapshot the MuJoCo state. Returned object is opaque -- pass it
+        back to `restore_sim_state` to rewind.
+        """
+        return self._env.sim.get_state()
+
+    def restore_sim_state(self, state) -> "LiberoObs":
+        """Rewind the MuJoCo state and re-derive obs. The caller still needs
+        to restore any *Python-level* rollout state (oracle, dense_targets,
+        latches) separately; this method handles the env side only.
+
+        Returns the obs at the restored state so the caller can refresh
+        `state.obs` without an explicit observe() step.
+        """
+        self._env.sim.set_state(state)
+        self._env.sim.forward()  # re-derive xpos / contact / sensors
+        return self._build_obs(self._env.env._get_observations(force_update=True))
+
+    def perturb_object_xy(self, dx: float, dy: float) -> "LiberoObs":
+        """Translate the configured perturb body in the xy plane by
+        (dx, dy) meters, then re-derive obs.
+
+        Implemented by mutating the freejoint qpos slice for the body.
+        Requires `perturb_body_name` to have been set at construction.
+        Returns the refreshed obs so the rollout loop's in-memory obs can
+        be updated without re-stepping.
+        """
+        if self._perturb_body_name is None:
+            raise RuntimeError(
+                "LiberoEnv: perturb_object_xy requires `perturb_body_name` "
+                "to be set at construction."
+            )
+        sim = self._env.sim
+        body_id = sim.model.body_name2id(self._perturb_body_name)
+        jnt_adr = sim.model.body_jntadr[body_id]
+        if jnt_adr < 0:
+            raise RuntimeError(
+                f"LiberoEnv: body {self._perturb_body_name!r} has no joint "
+                "(can't perturb its qpos)."
+            )
+        qpos_adr = sim.model.jnt_qposadr[jnt_adr]
+        sim.data.qpos[qpos_adr + 0] += float(dx)
+        sim.data.qpos[qpos_adr + 1] += float(dy)
+        sim.forward()
+        return self._build_obs(self._env.env._get_observations(force_update=True))
 
     def _build_obs(self, obs: dict) -> LiberoObs:
         import robosuite.utils.camera_utils as camera_utils

@@ -1,8 +1,18 @@
-"""Per-trial rollout loop + failure-mode classifier."""
+"""Per-trial rollout loop + failure-mode classifier.
+
+Public API:
+    - `run_trial(env, predict_fn, seed, ...)`: original end-to-end entry
+      point. Wraps build_initial_state + run_segment + finalize_trial.
+    - `build_initial_state(...) / run_segment(...) / finalize_trial(...)`:
+      segmented interface used by trigger/collect.py to fork rollouts at
+      arbitrary t. run_segment can resume from any t and accepts an
+      explicit replan schedule and an on_step callback (used by the
+      collect driver to inject perturbations and capture snapshots).
+"""
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 
@@ -34,6 +44,36 @@ class TrialResult:
     failure_mode: str
     diag: dict = field(default_factory=dict)
     initial_rgb: np.ndarray = None
+
+
+@dataclass
+class RolloutState:
+    """All per-step loop state needed to (a) continue stepping a rollout
+    from any t, and (b) deep-copy/restore the rollout for counterfactual
+    branching. Anything the inner loop in `run_segment` reads or writes
+    lives here; nothing else does.
+    """
+    t: int                           # next step index to execute
+    obs: Any                         # last observation (LiberoObs or stub)
+    dense_targets: np.ndarray        # [horizon, 3], world frame
+    sel_diag: dict                   # diag from initial plan_from_obs
+    oracle: GripperOracle
+    closed_at_t: int | None
+    opened_at_t: int | None
+    ee_at_close: np.ndarray | None
+    obj_at_close: np.ndarray | None
+    ee_at_open: np.ndarray | None
+    basket_at_open: np.ndarray | None
+    placing_latched: bool
+    placing_started_at_t: int | None
+    success: bool
+    steps: int                       # final step count (set on termination)
+    terminated: bool                 # True once success/done fired
+    final_obs: Any
+    initial_rgb: np.ndarray          # obs.rgb at t=0 (for TrialResult)
+    logs: dict[str, list[float]]     # obj_z, ee_err, ee_obj, ee_obj_xy,
+                                     #   ee_obj_z, ee_basket_xy, ee_basket_z
+    rgb_frames: list[np.ndarray] | None  # None when viz_dir is None
 
 
 def classify_failure_mode(success: bool,
@@ -246,145 +286,150 @@ def plan_from_obs(obs, predict_fn: Callable, *,
     return dense_targets, sel_diag
 
 
-def run_trial(env, predict_fn: Callable, seed: int,
-              dz_scale: float = 1.0,
-              placement_mode: str = "trace",
-              replan_freq: int = 0,
-              viz_replans: str = "all",
-              viz_dir: Path | None = None) -> TrialResult:
-    """Run one trial. Returns TrialResult including artifacts.
-
-    predict_fn: (rgb, depth, language) -> (rgb_t [3,S,S], depth_t [1,S,S]|None,
-                                           pred_trace [400, 32, 3] numpy, relative).
-    dz_scale:   multiplier on the model's predicted dz before cumsum, to
-                convert training-monocular units into metric meters.
-    placement_mode: how the carry-phase target.z is computed once the object
-                enters the goal region's xy footprint.
-                  - 'trace':   target.z follows dense_targets verbatim (the
-                               model + linear-interp anchor decide altitude).
-                  - 'descend': target.z is overridden to (goal.z + half_z +
-                               GOAL_Z_PLACE_OFFSET) so the EE actively descends
-                               to a low placement altitude before the oracle
-                               opens the gripper. Drops mug from ~5 cm above
-                               the box top -> short freefall, lands in region.
-    replan_freq: replan every N env steps. 0 (default) = one-shot at t=0
-                (legacy open-loop behavior). When >0, the predict -> lift ->
-                top-K -> world -> anchor -> interp pipeline reruns at t in
-                {N, 2N, ...} (strictly less than env.horizon) using the
-                current obs, and dense_targets[t:env.horizon] is overwritten
-                with a fresh plan interpolated to env.horizon - t steps.
-                Each replan anchors at the CURRENT obs.ee_pose. The post-grasp
-                hold + descend latch sit on top of dense_targets, so they
-                still take precedence when active; replans during those
-                overrides are wasted compute but harmless.
-    viz_replans: per-replan artifact policy, one of 'first', 'all', 'none'.
-                'all' (default) writes pred_traces.png / selected_traces.png /
-                world_trace_overlay.png / traces_3d.npz / combined_trace_world.npz
-                under viz_dir/replan_TTT/ for every plan (t=0 plus each replan).
-                'first' writes them only for the t=0 plan. 'none' suppresses
-                per-plan artifacts entirely. rollout.mp4 and initial_rgb.png
-                are unaffected -- they're trial-level and still go in viz_dir.
-    viz_dir:    per-trial directory. When set, per-plan artifacts go in
-                viz_dir/replan_TTT/ (subject to viz_replans), rollout.mp4 goes
-                in viz_dir.
-    """
-    if placement_mode not in ("trace", "descend"):
-        raise ValueError(
-            f"placement_mode must be 'trace' or 'descend', got {placement_mode!r}"
-        )
+def _validate_viz_replans(viz_replans: str) -> None:
     if viz_replans not in ("first", "all", "none"):
         raise ValueError(
             f"viz_replans must be 'first', 'all', or 'none', got {viz_replans!r}"
         )
+
+
+def _validate_placement_mode(placement_mode: str) -> None:
+    if placement_mode not in ("trace", "descend"):
+        raise ValueError(
+            f"placement_mode must be 'trace' or 'descend', got {placement_mode!r}"
+        )
+
+
+def _plan_viz_dir(t: int, viz_dir: Path | None, viz_replans: str) -> Path | None:
+    if viz_dir is None or viz_replans == "none":
+        return None
+    if viz_replans == "first" and t != 0:
+        return None
+    return viz_dir / f"replan_{t:03d}"
+
+
+def build_initial_state(env, predict_fn: Callable, seed: int, *,
+                        dz_scale: float = 1.0,
+                        placement_mode: str = "trace",
+                        viz_replans: str = "all",
+                        viz_dir: Path | None = None) -> RolloutState:
+    """Reset the env, plan once at t=0, return a RolloutState ready for
+    `run_segment` to step forward."""
+    _validate_placement_mode(placement_mode)
+    _validate_viz_replans(viz_replans)
     obs = env.reset(seed=seed)
-    obs0 = obs
-
-    def _plan_viz_dir(t: int) -> Path | None:
-        if viz_dir is None or viz_replans == "none":
-            return None
-        if viz_replans == "first" and t != 0:
-            return None
-        return viz_dir / f"replan_{t:03d}"
-
     dense_targets, sel_diag = plan_from_obs(
         obs, predict_fn,
         dz_scale=dz_scale, n_steps=env.horizon,
-        viz_dir=_plan_viz_dir(0),
+        viz_dir=_plan_viz_dir(0, viz_dir, viz_replans),
     )
-
-    oracle = GripperOracle()
-    obj_z_log, ee_err_log = [], []
-    # Per-step EE-vs-target geometry for threshold calibration. Lets you see
-    # whether grasp_miss is "trace never got close" (large min distances) vs
-    # "EE was close but oracle threshold didn't fire" (small min, close gate
-    # never triggered) vs "EE-pos is offset from grip TCP" (z_min biased).
-    ee_obj_log, ee_obj_xy_log, ee_obj_z_log = [], [], []
-    ee_basket_xy_log, ee_basket_z_log = [], []
-    closed_at_t: int | None = None
-    opened_at_t: int | None = None
-    ee_at_close: np.ndarray | None = None  # EE world pos when grasp fired
-    ee_at_open: np.ndarray | None = None   # EE world pos when release fired
-    obj_at_close: np.ndarray | None = None # mug world pos at grasp time
-    basket_at_open: np.ndarray | None = None  # basket world xy at release time
-    # Capture flipped (top-down, display orientation) rgb each step for the
-    # rollout.mp4. Includes the reset frame as t=0.
     rgb_frames = ([np.ascontiguousarray(obs.rgb[::-1])]
                   if viz_dir is not None else None)
-    success = False
-    steps = env.horizon
-    final_obs = obs
-    # Latched in 'descend' mode the first step the mug enters the goal region's
-    # xy footprint. Once latched, target.z stays clamped to placement altitude
-    # for the rest of the carry phase, even if the trace's xy drifts the mug
-    # back out of the region. Without this latch, the trace can graze the
-    # region for 1-2 steps and the OSC controller (5 cm/step max) can't
-    # descend meaningfully before the override stops firing.
-    placing_latched = False
-    placing_started_at_t: int | None = None
-    for t in range(env.horizon):
+    return RolloutState(
+        t=0,
+        obs=obs,
+        dense_targets=dense_targets,
+        sel_diag=sel_diag,
+        oracle=GripperOracle(),
+        closed_at_t=None,
+        opened_at_t=None,
+        ee_at_close=None,
+        obj_at_close=None,
+        ee_at_open=None,
+        basket_at_open=None,
+        placing_latched=False,
+        placing_started_at_t=None,
+        success=False,
+        steps=env.horizon,
+        terminated=False,
+        final_obs=obs,
+        initial_rgb=obs.rgb,
+        logs={
+            "obj_z": [], "ee_err": [],
+            "ee_obj": [], "ee_obj_xy": [], "ee_obj_z": [],
+            "ee_basket_xy": [], "ee_basket_z": [],
+        },
+        rgb_frames=rgb_frames,
+    )
+
+
+def run_segment(env, state: RolloutState, predict_fn: Callable, *,
+                t_end: int,
+                replan_at: list[int] | None = None,
+                dz_scale: float = 1.0,
+                placement_mode: str = "trace",
+                viz_replans: str = "all",
+                viz_dir: Path | None = None,
+                on_step: Callable[[RolloutState, int], None] | None = None
+                ) -> RolloutState:
+    """Step the rollout forward from state.t to t_end (exclusive).
+
+    replan_at:    sorted iterable of step indices where to call plan_from_obs
+                  and overwrite dense_targets[t:env.horizon]. (Does NOT
+                  include t=0 -- that's done by build_initial_state.)
+    on_step:      optional callback `on_step(state, t)` invoked at the top of
+                  each iteration BEFORE any logic. Used by the data-collection
+                  driver to inject perturbations (mutate state.obs after
+                  calling env.perturb_object_xy) and capture snapshots.
+    """
+    _validate_placement_mode(placement_mode)
+    _validate_viz_replans(viz_replans)
+    if state.terminated:
+        return state
+    replan_set = set(replan_at or [])
+
+    for t in range(state.t, t_end):
+        if on_step is not None:
+            on_step(state, t)
+        obs = state.obs
+
         # Replan trigger: rerun plan_from_obs on the current obs and overwrite
         # the tail dense_targets[t:env.horizon] with a fresh plan anchored at
-        # the current EE. t=0 plan was already computed above; first replan is
-        # at t=replan_freq. The post-grasp hold + descend latch still take
+        # the current EE. The post-grasp hold + descend latch still take
         # precedence on the resulting target since they sit on top of
         # dense_targets[t], so a replan during those overrides is wasted but
         # harmless.
-        if replan_freq > 0 and t > 0 and t % replan_freq == 0:
+        if t in replan_set:
             new_targets, _ = plan_from_obs(
                 obs, predict_fn,
                 dz_scale=dz_scale, n_steps=env.horizon - t,
-                viz_dir=_plan_viz_dir(t),
+                viz_dir=_plan_viz_dir(t, viz_dir, viz_replans),
             )
-            dense_targets[t:env.horizon] = new_targets
+            state.dense_targets[t:env.horizon] = new_targets
             logger.info(
                 "replan at t=%d: rewrote dense_targets[%d:%d] (%d steps)",
                 t, t, env.horizon, env.horizon - t,
             )
-        prev_state = oracle.state
-        gripper = oracle.step(obs.ee_pose[:3], obs.object_pos, obs.goal_pos,
-                              obs.goal_half_extents)
-        if prev_state != oracle.state and oracle.state == "CLOSED_ON_OBJECT":
-            closed_at_t = t
-            ee_at_close = obs.ee_pose[:3].copy()
-            obj_at_close = obs.object_pos.copy()
-        if prev_state != oracle.state and oracle.state == "OPEN_AT_GOAL":
-            opened_at_t = t
-            ee_at_open = obs.ee_pose[:3].copy()
-            basket_at_open = obs.goal_pos.copy()
+
+        prev_state = state.oracle.state
+        gripper = state.oracle.step(obs.ee_pose[:3], obs.object_pos,
+                                    obs.goal_pos, obs.goal_half_extents)
+        if prev_state != state.oracle.state \
+                and state.oracle.state == "CLOSED_ON_OBJECT":
+            state.closed_at_t = t
+            state.ee_at_close = obs.ee_pose[:3].copy()
+            state.obj_at_close = obs.object_pos.copy()
+        if prev_state != state.oracle.state \
+                and state.oracle.state == "OPEN_AT_GOAL":
+            state.opened_at_t = t
+            state.ee_at_open = obs.ee_pose[:3].copy()
+            state.basket_at_open = obs.goal_pos.copy()
         # Post-grasp override: hold the EE at the grasp pose for HOLD_STEPS so
         # the gripper can finish closing before lateral motion shears the
         # marginal grip. After the buffer, resume dense_targets shifted
         # backward by HOLD_STEPS so the trajectory's shape is preserved --
         # only the last HOLD_STEPS planned steps fall off the horizon end.
-        if closed_at_t is not None and t > closed_at_t:
-            delta = t - closed_at_t
+        if state.closed_at_t is not None and t > state.closed_at_t:
+            delta = t - state.closed_at_t
             if delta <= POST_GRASP_HOLD_STEPS:
-                target = ee_at_close
+                target = state.ee_at_close
             else:
-                idx = max(closed_at_t, t - POST_GRASP_HOLD_STEPS)
-                target = dense_targets[min(idx, len(dense_targets) - 1)]
+                idx = max(state.closed_at_t, t - POST_GRASP_HOLD_STEPS)
+                target = state.dense_targets[
+                    min(idx, len(state.dense_targets) - 1)
+                ]
         else:
-            target = dense_targets[t]
+            target = state.dense_targets[t]
         # Descend-before-release override (latched): once the object first
         # enters the goal region's xy footprint with the gripper still closed,
         # set placing_latched=True and clamp target.z to (goal_z + half_z +
@@ -393,62 +438,68 @@ def run_trial(env, predict_fn: Callable, seed: int,
         # graze the region for just 1-2 steps before drifting back out, and
         # the OSC controller (5 cm/step max) cannot descend the EE
         # meaningfully in that window if we only override while currently
-        # inside. In 'trace' mode this branch is skipped and target.z follows
-        # the trace verbatim.
-        # Latch trigger uses a wider radius than the region's actual footprint
-        # (PLACE_LATCH_RADIUS, default 15 cm) so the descent begins *before*
-        # the mug reaches the region. With a tighter trigger (e.g. inside_xy)
-        # the trace can graze the region in 1-2 steps and the OSC controller
-        # has no time to lower the EE before release fires.
+        # inside.
         if (placement_mode == "descend"
-                and oracle.state == "CLOSED_ON_OBJECT"
-                and not placing_latched):
+                and state.oracle.state == "CLOSED_ON_OBJECT"
+                and not state.placing_latched):
             xy_to_goal = float(np.linalg.norm(
                 obs.object_pos[:2] - obs.goal_pos[:2]
             ))
             if xy_to_goal < PLACE_LATCH_RADIUS:
-                placing_latched = True
-                placing_started_at_t = t
-                logger.info("placement: descend latched at t=%d (object_xy=%s,"
-                            " goal_xy=%s, |xy|=%.3f m)", t,
+                state.placing_latched = True
+                state.placing_started_at_t = t
+                logger.info("placement: descend latched at t=%d "
+                            "(object_xy=%s, goal_xy=%s, |xy|=%.3f m)", t,
                             np.round(obs.object_pos[:2], 3).tolist(),
                             np.round(obs.goal_pos[:2], 3).tolist(),
                             xy_to_goal)
-        if placement_mode == "descend" and placing_latched \
-                and oracle.state == "CLOSED_ON_OBJECT":
+        if placement_mode == "descend" and state.placing_latched \
+                and state.oracle.state == "CLOSED_ON_OBJECT":
             half_z = (float(obs.goal_half_extents[2])
                       if obs.goal_half_extents is not None else 0.0)
             place_z = float(obs.goal_pos[2]) + half_z + GOAL_Z_PLACE_OFFSET
             target = np.array([target[0], target[1], place_z], dtype=np.float32)
         action = build_osc_action(target, gripper, obs.ee_pose[:3])
         obs, _, done, info = env.step(action)
-        obj_z_log.append(float(obs.object_pos[2]))
-        ee_err_log.append(float(np.linalg.norm(target - obs.ee_pose[:3])))
-        ee_obj_log.append(float(np.linalg.norm(obs.ee_pose[:3] - obs.object_pos)))
-        ee_obj_xy_log.append(float(np.linalg.norm(obs.ee_pose[:2] - obs.object_pos[:2])))
-        ee_obj_z_log.append(float(obs.ee_pose[2] - obs.object_pos[2]))
-        ee_basket_xy_log.append(float(np.linalg.norm(obs.ee_pose[:2] - obs.goal_pos[:2])))
-        ee_basket_z_log.append(float(obs.ee_pose[2] - obs.goal_pos[2]))
-        if rgb_frames is not None:
-            rgb_frames.append(np.ascontiguousarray(obs.rgb[::-1]))
-        final_obs = obs
+        state.obs = obs
+        state.logs["obj_z"].append(float(obs.object_pos[2]))
+        state.logs["ee_err"].append(float(np.linalg.norm(target - obs.ee_pose[:3])))
+        state.logs["ee_obj"].append(float(np.linalg.norm(obs.ee_pose[:3] - obs.object_pos)))
+        state.logs["ee_obj_xy"].append(float(np.linalg.norm(obs.ee_pose[:2] - obs.object_pos[:2])))
+        state.logs["ee_obj_z"].append(float(obs.ee_pose[2] - obs.object_pos[2]))
+        state.logs["ee_basket_xy"].append(float(np.linalg.norm(obs.ee_pose[:2] - obs.goal_pos[:2])))
+        state.logs["ee_basket_z"].append(float(obs.ee_pose[2] - obs.goal_pos[2]))
+        if state.rgb_frames is not None:
+            state.rgb_frames.append(np.ascontiguousarray(obs.rgb[::-1]))
+        state.final_obs = obs
+        state.t = t + 1
         if info.get("success", False):
-            success = True
-            steps = t
+            state.success = True
+            state.steps = t
+            state.terminated = True
             break
         if done:
-            # Env signaled termination without success -- stop stepping a
-            # finished env and let classify_failure_mode decide why.
-            steps = t
+            # Env signaled termination without success -- stop stepping and
+            # let classify_failure_mode decide why.
+            state.steps = t
+            state.terminated = True
             break
 
-    if viz_dir is not None and rgb_frames:
-        from sim.viz import save_rollout_video
-        save_rollout_video(rgb_frames, viz_dir / "rollout", fps=30)
+    return state
 
-    ee_obj_arr = np.asarray(ee_obj_log, dtype=np.float32)
-    ee_obj_xy_arr = np.asarray(ee_obj_xy_log, dtype=np.float32)
-    ee_obj_z_arr = np.asarray(ee_obj_z_log, dtype=np.float32)
+
+def finalize_trial(state: RolloutState, viz_dir: Path | None = None) -> TrialResult:
+    """Build TrialResult from a (possibly terminated) RolloutState. Writes
+    rollout.mp4 to viz_dir if rgb_frames were captured."""
+    if viz_dir is not None and state.rgb_frames:
+        from sim.viz import save_rollout_video
+        save_rollout_video(state.rgb_frames, viz_dir / "rollout", fps=30)
+
+    ee_obj_arr = np.asarray(state.logs["ee_obj"], dtype=np.float32)
+    ee_obj_xy_arr = np.asarray(state.logs["ee_obj_xy"], dtype=np.float32)
+    ee_obj_z_arr = np.asarray(state.logs["ee_obj_z"], dtype=np.float32)
+    ee_basket_xy_arr = np.asarray(state.logs["ee_basket_xy"], dtype=np.float32)
+    ee_basket_z_arr = np.asarray(state.logs["ee_basket_z"], dtype=np.float32)
     t_min_obj = int(ee_obj_arr.argmin()) if ee_obj_arr.size else -1
     logger.info(
         "ee-vs-object: |min 3d|=%.3f m at t=%d; min |xy|=%.3f m; "
@@ -460,55 +511,83 @@ def run_trial(env, predict_fn: Callable, seed: int,
         float(ee_obj_xy_arr.min()) if ee_obj_xy_arr.size else float("nan"),
         float(ee_obj_z_arr.min()) if ee_obj_z_arr.size else float("nan"),
         float(ee_obj_z_arr.max()) if ee_obj_z_arr.size else float("nan"),
-        closed_at_t,
-        float(np.asarray(ee_basket_xy_log, dtype=np.float32).min())
-        if ee_basket_xy_log else float("nan"),
-        float(np.asarray(ee_basket_z_log, dtype=np.float32).min())
-        if ee_basket_z_log else float("nan"),
-        float(np.asarray(ee_basket_z_log, dtype=np.float32).max())
-        if ee_basket_z_log else float("nan"),
-        opened_at_t,
+        state.closed_at_t,
+        float(ee_basket_xy_arr.min()) if ee_basket_xy_arr.size else float("nan"),
+        float(ee_basket_z_arr.min()) if ee_basket_z_arr.size else float("nan"),
+        float(ee_basket_z_arr.max()) if ee_basket_z_arr.size else float("nan"),
+        state.opened_at_t,
     )
-    if closed_at_t is not None:
+    if state.closed_at_t is not None:
         logger.info(
             "grasp event: t=%d ee=%s obj=%s |ee-obj xy|=%.3f m, z_above=%.3f m",
-            closed_at_t,
-            np.round(ee_at_close, 3).tolist(),
-            np.round(obj_at_close, 3).tolist(),
-            float(np.linalg.norm(ee_at_close[:2] - obj_at_close[:2])),
-            float(ee_at_close[2] - obj_at_close[2]),
+            state.closed_at_t,
+            np.round(state.ee_at_close, 3).tolist(),
+            np.round(state.obj_at_close, 3).tolist(),
+            float(np.linalg.norm(state.ee_at_close[:2] - state.obj_at_close[:2])),
+            float(state.ee_at_close[2] - state.obj_at_close[2]),
         )
-    if opened_at_t is not None:
+    if state.opened_at_t is not None:
         logger.info(
             "release event: t=%d ee=%s basket=%s |ee-basket xy|=%.3f m, "
             "z_above=%.3f m",
-            opened_at_t,
-            np.round(ee_at_open, 3).tolist(),
-            np.round(basket_at_open, 3).tolist(),
-            float(np.linalg.norm(ee_at_open[:2] - basket_at_open[:2])),
-            float(ee_at_open[2] - basket_at_open[2]),
+            state.opened_at_t,
+            np.round(state.ee_at_open, 3).tolist(),
+            np.round(state.basket_at_open, 3).tolist(),
+            float(np.linalg.norm(state.ee_at_open[:2] - state.basket_at_open[:2])),
+            float(state.ee_at_open[2] - state.basket_at_open[2]),
         )
-    # Release-gate diagnostics: tells you which condition failed when
-    # opened_at_t is None. ever_inside_xy=False means the object never entered
-    # the region's xy footprint; ever_above=False means it was never high
-    # enough above the box top + clearance; both True but
-    # released_via=None means the closest-approach trigger never fired (e.g.
-    # the trace passed through with monotonically decreasing xy_dist) AND the
-    # exit-fallback didn't catch it.
     logger.info(
         "release gate diag: %s; min_xy_inside_above=%s",
-        {k: v for k, v in oracle.diag.items() if k != "min_xy_dist_inside_above"},
-        f"{oracle.diag['min_xy_dist_inside_above']:.3f} m"
-        if oracle.diag["min_xy_dist_inside_above"] != float("inf") else "inf",
+        {k: v for k, v in state.oracle.diag.items()
+         if k != "min_xy_dist_inside_above"},
+        f"{state.oracle.diag['min_xy_dist_inside_above']:.3f} m"
+        if state.oracle.diag["min_xy_dist_inside_above"] != float("inf")
+        else "inf",
     )
 
     failure_mode = classify_failure_mode(
-        success=success,
-        object_z_trajectory=np.asarray(obj_z_log, dtype=np.float32),
-        object_xy_final=final_obs.object_pos[:2],
-        basket_xy=final_obs.goal_pos[:2],
-        ee_target_errors=np.asarray(ee_err_log, dtype=np.float32),
+        success=state.success,
+        object_z_trajectory=np.asarray(state.logs["obj_z"], dtype=np.float32),
+        object_xy_final=state.final_obs.object_pos[:2],
+        basket_xy=state.final_obs.goal_pos[:2],
+        ee_target_errors=np.asarray(state.logs["ee_err"], dtype=np.float32),
     )
-    return TrialResult(success=success, steps=steps,
-                       failure_mode=failure_mode, diag=sel_diag,
-                       initial_rgb=obs0.rgb)
+    return TrialResult(success=state.success, steps=state.steps,
+                       failure_mode=failure_mode, diag=state.sel_diag,
+                       initial_rgb=state.initial_rgb)
+
+
+def run_trial(env, predict_fn: Callable, seed: int,
+              dz_scale: float = 1.0,
+              placement_mode: str = "trace",
+              replan_freq: int = 0,
+              viz_replans: str = "all",
+              viz_dir: Path | None = None) -> TrialResult:
+    """Run one trial end-to-end. Thin wrapper over
+    build_initial_state + run_segment + finalize_trial.
+
+    placement_mode: 'trace' (target.z follows dense_targets) or 'descend'
+                    (target.z is clamped to placement altitude once the
+                    object enters the goal region).
+    replan_freq:    0 = one-shot at t=0 (legacy). N>0 = replan at t in
+                    {N, 2N, ...} (strictly less than env.horizon).
+    viz_replans:    'first' / 'all' / 'none'. Per-plan artifact policy.
+    viz_dir:        per-trial directory. None disables viz.
+    """
+    state = build_initial_state(env, predict_fn, seed,
+                                dz_scale=dz_scale,
+                                placement_mode=placement_mode,
+                                viz_replans=viz_replans,
+                                viz_dir=viz_dir)
+    if replan_freq > 0:
+        replan_at = list(range(replan_freq, env.horizon, replan_freq))
+    else:
+        replan_at = []
+    state = run_segment(env, state, predict_fn,
+                        t_end=env.horizon,
+                        replan_at=replan_at,
+                        dz_scale=dz_scale,
+                        placement_mode=placement_mode,
+                        viz_replans=viz_replans,
+                        viz_dir=viz_dir)
+    return finalize_trial(state, viz_dir=viz_dir)
