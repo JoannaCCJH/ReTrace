@@ -105,7 +105,22 @@ def main():
                              "at t=0. With N>0, the predict->lift->top-K->world "
                              "->anchor->interp pipeline reruns at t in {N, 2N, "
                              "...} on the current obs, and the tail of "
-                             "dense_targets is overwritten with a fresh plan.")
+                             "dense_targets is overwritten with a fresh plan. "
+                             "Mutually exclusive with --trigger_ckpt.")
+    parser.add_argument("--trigger_ckpt", default=None,
+                        help="Path to a trigger MLP checkpoint (from "
+                             "trigger.train). When set, replan decisions are "
+                             "made at runtime by the MLP -- queried every "
+                             "--trigger_freq steps; replans fire when the "
+                             "predicted probability exceeds --trigger_threshold.")
+    parser.add_argument("--trigger_threshold", type=float, default=0.5,
+                        help="Sigmoid threshold above which the trigger MLP "
+                             "fires a replan. Only used when --trigger_ckpt "
+                             "is set.")
+    parser.add_argument("--trigger_freq", type=int, default=20,
+                        help="Query the trigger MLP every N env steps. Only "
+                             "used when --trigger_ckpt is set. The model is "
+                             "not called on intermediate steps.")
     parser.add_argument("--viz_replans", choices=["first", "all", "none"],
                         default="all",
                         help="Per-plan viz artifact policy. 'all' (default) "
@@ -160,6 +175,24 @@ def main():
     logger.info("model depth conditioning: %s",
                 "obs.depth (metric)" if args.use_depth else "mask token (depth=None)")
 
+    if args.replan_freq > 0 and args.trigger_ckpt is not None:
+        parser.error("--replan_freq and --trigger_ckpt are mutually "
+                     "exclusive: pick a fixed schedule OR the learned trigger.")
+
+    replan_decider = None
+    if args.trigger_ckpt is not None:
+        from trigger.decider import load_trigger_decider
+        from sim.constants import EPISODE_HORIZON
+        replan_decider = load_trigger_decider(
+            args.trigger_ckpt,
+            threshold=args.trigger_threshold,
+            trigger_freq=args.trigger_freq,
+            horizon=EPISODE_HORIZON,
+        )
+        logger.info("trigger: ckpt=%s threshold=%.3f freq=%d",
+                    args.trigger_ckpt, args.trigger_threshold,
+                    args.trigger_freq)
+
     # site overrides body when both are present (the body default is the
     # cream-cheese task's bowl; for region-goal tasks the user passes a site).
     goal_body = None if args.goal_site_name else args.goal_body_name
@@ -181,6 +214,7 @@ def main():
                       dz_scale=args.dz_scale,
                       placement_mode=args.placement_mode,
                       replan_freq=args.replan_freq,
+                      replan_decider=replan_decider,
                       viz_replans=args.viz_replans,
                       viz_dir=trial_dir)
         _save_trial_artifacts(trial_dir, r)

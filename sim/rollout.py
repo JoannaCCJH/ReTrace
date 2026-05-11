@@ -356,6 +356,7 @@ def build_initial_state(env, predict_fn: Callable, seed: int, *,
 def run_segment(env, state: RolloutState, predict_fn: Callable, *,
                 t_end: int,
                 replan_at: list[int] | None = None,
+                replan_decider: Callable[[RolloutState, int], bool] | None = None,
                 dz_scale: float = 1.0,
                 placement_mode: str = "trace",
                 viz_replans: str = "all",
@@ -364,13 +365,18 @@ def run_segment(env, state: RolloutState, predict_fn: Callable, *,
                 ) -> RolloutState:
     """Step the rollout forward from state.t to t_end (exclusive).
 
-    replan_at:    sorted iterable of step indices where to call plan_from_obs
-                  and overwrite dense_targets[t:env.horizon]. (Does NOT
-                  include t=0 -- that's done by build_initial_state.)
-    on_step:      optional callback `on_step(state, t)` invoked at the top of
-                  each iteration BEFORE any logic. Used by the data-collection
-                  driver to inject perturbations (mutate state.obs after
-                  calling env.perturb_object_xy) and capture snapshots.
+    replan_at:      sorted iterable of step indices where to call
+                    plan_from_obs and overwrite dense_targets[t:env.horizon].
+                    (Does NOT include t=0 -- that's done by
+                    build_initial_state.)
+    replan_decider: optional `f(state, t) -> bool`. Queried at every step
+                    AFTER the replan_at check; when it returns True a replan
+                    is issued. The two sources are unioned -- a step fires
+                    plan_from_obs at most once even if both flag it.
+    on_step:        optional callback `on_step(state, t)` invoked at the top
+                    of each iteration BEFORE any logic. Used by the
+                    data-collection driver to inject perturbations and
+                    capture snapshots.
     """
     _validate_placement_mode(placement_mode)
     _validate_viz_replans(viz_replans)
@@ -383,13 +389,13 @@ def run_segment(env, state: RolloutState, predict_fn: Callable, *,
             on_step(state, t)
         obs = state.obs
 
-        # Replan trigger: rerun plan_from_obs on the current obs and overwrite
-        # the tail dense_targets[t:env.horizon] with a fresh plan anchored at
-        # the current EE. The post-grasp hold + descend latch still take
-        # precedence on the resulting target since they sit on top of
-        # dense_targets[t], so a replan during those overrides is wasted but
-        # harmless.
-        if t in replan_set:
+        # Replan trigger: schedule (replan_set) and/or learned decider. Both
+        # collapse into the same plan_from_obs call -- scheduling and
+        # runtime triggers shouldn't double-replan on the same step.
+        should_replan = (t in replan_set) or (
+            replan_decider is not None and replan_decider(state, t)
+        )
+        if should_replan:
             new_targets, _ = plan_from_obs(
                 obs, predict_fn,
                 dz_scale=dz_scale, n_steps=env.horizon - t,
@@ -561,18 +567,22 @@ def run_trial(env, predict_fn: Callable, seed: int,
               dz_scale: float = 1.0,
               placement_mode: str = "trace",
               replan_freq: int = 0,
+              replan_decider: Callable[[RolloutState, int], bool] | None = None,
               viz_replans: str = "all",
               viz_dir: Path | None = None) -> TrialResult:
     """Run one trial end-to-end. Thin wrapper over
     build_initial_state + run_segment + finalize_trial.
 
-    placement_mode: 'trace' (target.z follows dense_targets) or 'descend'
-                    (target.z is clamped to placement altitude once the
-                    object enters the goal region).
-    replan_freq:    0 = one-shot at t=0 (legacy). N>0 = replan at t in
-                    {N, 2N, ...} (strictly less than env.horizon).
-    viz_replans:    'first' / 'all' / 'none'. Per-plan artifact policy.
-    viz_dir:        per-trial directory. None disables viz.
+    placement_mode:  'trace' (target.z follows dense_targets) or 'descend'
+                     (target.z is clamped to placement altitude once the
+                     object enters the goal region).
+    replan_freq:     0 = one-shot at t=0 (legacy). N>0 = replan at t in
+                     {N, 2N, ...} (strictly less than env.horizon).
+    replan_decider:  optional runtime decider `f(state, t) -> bool` for
+                     learned-trigger replanning. Caller is responsible for
+                     deciding how this composes with replan_freq.
+    viz_replans:     'first' / 'all' / 'none'. Per-plan artifact policy.
+    viz_dir:         per-trial directory. None disables viz.
     """
     state = build_initial_state(env, predict_fn, seed,
                                 dz_scale=dz_scale,
@@ -586,6 +596,7 @@ def run_trial(env, predict_fn: Callable, seed: int,
     state = run_segment(env, state, predict_fn,
                         t_end=env.horizon,
                         replan_at=replan_at,
+                        replan_decider=replan_decider,
                         dz_scale=dz_scale,
                         placement_mode=placement_mode,
                         viz_replans=viz_replans,
